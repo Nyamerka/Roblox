@@ -10,9 +10,9 @@ pos = mc.player.getTilePos()
 SAFE_BLOCK = block.WOOD_PLANKS.id
 FAKE_BLOCK = block.GLASS.id
 CHECKPOINT_BLOCK = block.WOOL.id, 13  # Green wool
-PLATFORM_WIDTH = 2    # X-axis size
-PLATFORM_LENGTH = 3   # Z-axis size
-PLATFORM_SPACING = 1  # Space between platforms
+PLATFORM_WIDTH = 2
+PLATFORM_LENGTH = 3
+PLATFORM_SPACING = 1
 INITIAL_PLATFORMS = 30
 
 # Initialize
@@ -20,55 +20,64 @@ start_x, start_y, start_z = pos.x, pos.y + 20, pos.z
 platforms = {}
 checkpoint = None
 score = 0
-last_safe_z = start_z
+processed_platforms = set()
+checkpoint_data = {}
 
-# Create iron starting platform (3x2)
+# Create iron starting platform
 mc.setBlocks(start_x - 1, start_y-1, start_z,
              start_x + 1, start_y-1, start_z + 2,
              block.IRON_BLOCK.id)
 mc.player.setTilePos(start_x, start_y, start_z + 1)
 
 def create_platform(base_z, is_left, is_fake):
-    """Create 2x3 platform at specified position"""
-    block_type = FAKE_BLOCK if is_fake else SAFE_BLOCK
     x_start = start_x - 2 if is_left else start_x + 1
+    block_type = FAKE_BLOCK if is_fake else SAFE_BLOCK
     for dx in range(PLATFORM_WIDTH):
         for dz in range(PLATFORM_LENGTH):
             x = x_start + dx
             z = base_z + dz
             mc.setBlock(x, start_y-1, z, block_type)
-            platforms[(x,z)] = ('fake' if is_fake else 'safe', False)
+            platforms[(x, z)] = {
+                'type': 'fake' if is_fake else 'safe',
+                'checkpoint': False,
+                'original': block_type
+            }
 
 def generate_platform_pair(z_pos):
-    """Generate two platforms (left and right)"""
-    # Randomly choose which side is safe
     left_is_fake = random.choice([True, False])
     right_is_fake = not left_is_fake
-    
-    # Create platforms
-    create_platform(z_pos, is_left=True, is_fake=left_is_fake)
-    create_platform(z_pos, is_left=False, is_fake=right_is_fake)
+    create_platform(z_pos, True, left_is_fake)
+    create_platform(z_pos, False, right_is_fake)
 
 def generate_bridge():
-    """Generate initial platform sequence"""
     current_z = start_z + PLATFORM_LENGTH
     for _ in range(INITIAL_PLATFORMS):
         generate_platform_pair(current_z)
         current_z += PLATFORM_LENGTH + PLATFORM_SPACING
 
-def update_checkpoint(z_pos):
-    global checkpoint
-    # Convert last safe platform to checkpoint
-    for x in [start_x-2, start_x+1]:
+def create_checkpoint(z_pos):
+    global checkpoint, checkpoint_data
+    checkpoint_data.clear()
+    
+    for side in [start_x-2, start_x+1]:
         for dx in range(PLATFORM_WIDTH):
             for dz in range(PLATFORM_LENGTH):
-                mc.setBlock(x+dx, start_y-1, z_pos+dz, CHECKPOINT_BLOCK[0], CHECKPOINT_BLOCK[1])
-                platforms[(x+dx, z_pos+dz)] = ('safe', True)
+                x = side + dx
+                z = z_pos + dz
+                checkpoint_data[(x, z)] = mc.getBlock(x, start_y-1, z)
+                mc.setBlock(x, start_y-1, z, CHECKPOINT_BLOCK[0], CHECKPOINT_BLOCK[1])
+                platforms[(x, z)]['checkpoint'] = True
+                
     checkpoint = z_pos
+
+def restore_checkpoint():
+    for (x, z), block_id in checkpoint_data.items():
+        mc.setBlock(x, start_y-1, z, block_id)
+        platforms[(x, z)]['checkpoint'] = False
+    checkpoint_data.clear()
 
 # Game setup
 mc.postToChat("Squid Game Bridge: Jump carefully!")
-mc.postToChat("Starting in 3 seconds...")
 time.sleep(3)
 generate_bridge()
 
@@ -79,46 +88,44 @@ while True:
     # Fall detection
     if pos.y < start_y - 2:
         if checkpoint:
+            restore_checkpoint()
             mc.player.setTilePos(start_x, start_y, checkpoint + 1)
             mc.postToChat("Teleported to checkpoint!")
+            checkpoint = None
         else:
             mc.player.setTilePos(start_x, start_y, start_z + 1)
             mc.postToChat(f"Game Over! Score: {score}")
         score = 0
+        processed_platforms.clear()
     
-    # Platform check
-    on_platform = any((pos.x + dx, pos.z + dz) in platforms
-                   for dx in [-1,0,1] for dz in [-1,0,1])
+    # Platform processing
+    current_platform_z = (pos.z // (PLATFORM_LENGTH + PLATFORM_SPACING)) * (PLATFORM_LENGTH + PLATFORM_SPACING)
     
-    if on_platform:
-        # Find exact platform block
-        for dz in range(-PLATFORM_LENGTH, PLATFORM_LENGTH):
-            for dx in range(-PLATFORM_WIDTH, PLATFORM_WIDTH):
-                block_pos = (pos.x + dx, pos.z + dz)
-                if block_pos in platforms:
-                    ptype, is_check = platforms[block_pos]
-                    
-                    if ptype == 'fake':
-                        # Destroy entire platform
-                        platform_z = block_pos[1] - dz
-                        for x in [start_x-2, start_x+1]:
-                            for px in range(PLATFORM_WIDTH):
-                                for pz in range(PLATFORM_LENGTH):
-                                    coord = (x + px, platform_z + pz)
-                                    if coord in platforms:
-                                        mc.setBlock(coord[0], start_y-1, coord[1], block.AIR.id)
-                                        del platforms[coord]
-                        score = max(0, score-1)
-                        mc.postToChat(f"Wrong! Score: {score}")
-                    
-                    else:
-                        score += 1
-                        last_safe_z = block_pos[1] - dz
-                        if score % 3 == 0:
-                            update_checkpoint(last_safe_z)
-                        mc.postToChat(f"Correct! Score: {score}")
-                    
-                    # Generate new platforms
-                    if block_pos[1] > start_z + INITIAL_PLATFORMS * (PLATFORM_LENGTH + PLATFORM_SPACING) - 10:
-                        generate_platform_pair(block_pos[1] + PLATFORM_LENGTH + PLATFORM_SPACING)
+    if current_platform_z not in processed_platforms and current_platform_z > start_z:
+        safe_found = False
+        # Check both platforms at this Z level
+        for side in [start_x-2, start_x+1]:
+            platform_type = None
+            for dz in range(PLATFORM_LENGTH):
+                if (side, current_platform_z + dz) in platforms:
+                    platform_type = platforms[(side, current_platform_z + dz)]['type']
                     break
+            
+            if platform_type == 'safe':
+                safe_found = True
+                score += 1
+                mc.postToChat(f"Correct! Score: {score}")
+                processed_platforms.add(current_platform_z)
+                
+                if score % 3 == 0:
+                    create_checkpoint(current_platform_z)
+                break
+        
+        if not safe_found:
+            score = max(0, score-1)
+            mc.postToChat(f"Wrong! Score: {score}")
+            processed_platforms.add(current_platform_z)
+    
+    # Generate new platforms
+    if current_platform_z > start_z + (INITIAL_PLATFORMS - 10) * (PLATFORM_LENGTH + PLATFORM_SPACING):
+        generate_platform_pair(current_platform_z + (PLATFORM_LENGTH + PLATFORM_SPACING))
